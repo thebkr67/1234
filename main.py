@@ -89,7 +89,7 @@ async def parse_wildberries(session, url):
                         continue
                 
                 logger.info(f"Найдено {len(products)} товаров с {url}")
-[04.03.2026 16:54] Alterecci: else:
+
                 logger.error(f"Ошибка HTTP {response.status} для {url}")
                 
     except Exception as e:
