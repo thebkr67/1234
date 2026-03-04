@@ -205,7 +205,7 @@ def main():
     """Основная функция запуска бота"""
     # Создаем приложение
     application = Application.builder().token(TOKEN).build()
-[04.03.2026 16:54] Alterecci: # Регистрируем обработчики команд
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("parse", parse_command))
     application.add_handler(CommandHandler("help", help_command))
