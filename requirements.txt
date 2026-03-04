@@ -1,4 +1,0 @@
-python-telegram-bot
-aiohttp
-python-dotenv
-google-search-results
