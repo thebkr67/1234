@@ -1,7 +1,4 @@
-httpx>=0.23.0
-python-dotenv>=1.0.0
-aiogram>=3.0.0
-pypdf>=3.0.0
-python-docx>=0.8.11
-openpyxl>=3.0.9
-Pillow>=9.0.0
+python-telegram-bot==20.7
+aiohttp
+beautifulsoup4
+openpyxl
