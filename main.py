@@ -215,27 +215,46 @@ async def parse_product_page(context, url: str) -> Dict:
         await page.wait_for_timeout(3000)
 
         # Наименование строго из h3
-        title = await get_text_by_selectors(page, [
-            "h3",
-            ".product-page h3",
-            "[class*='product'] h3",
-        ])
+title = None
 
-        # Категория строго из нужного span
-        category = None
+try:
+    await page.wait_for_selector("h3", timeout=7000)
+    title = await page.locator("h3").first.inner_text()
+    title = " ".join(title.split())
+except:
+    pass
 
-        try:
-            await page.wait_for_selector("span.categoryLinkCategory--VSJ8c", timeout=7000)
-            category = await page.locator("span.categoryLinkCategory--VSJ8c").first.inner_text()
-            category = " ".join(category.split())
-        except Exception:
-            pass
+# fallback если h3 не появился
+if not title:
+    try:
+        html = await page.content()
+        match = re.search(r"<h3[^>]*>(.*?)</h3>", html)
+        if match:
+            title = re.sub("<.*?>", "", match.group(1)).strip()
+    except:
+        pass
 
-        if not category:
-            category = await get_text_by_selectors(page, [
-                "span.categoryLinkCategory--VSJ8c",
-                "span[class*='categoryLinkCategory']",
-            ])
+category = None
+
+try:
+    await page.wait_for_selector("span.categoryLinkCategory--VSJ8c", timeout=7000)
+    category = await page.locator("span.categoryLinkCategory--VSJ8c").first.inner_text()
+    category = " ".join(category.split())
+except:
+    pass
+
+# fallback через HTML
+if not category:
+    try:
+        html = await page.content()
+        match = re.search(
+            r'class="categoryLinkCategory--VSJ8c">(.*?)</span>',
+            html
+        )
+        if match:
+            category = match.group(1).strip()
+    except:
+        pass
 
         # Картинка
         image = await get_image_by_selectors(page, [
