@@ -15,7 +15,11 @@ from PIL import Image as PILImage
 
 TG_TOKEN = os.getenv("TG_BOT_TOKEN")
 
-SELLER_URL = "https://www.wildberries.ru/seller/92351?sort=newly&page=1"
+SELLERS = [
+    {"name": "МС", "url": "https://www.wildberries.ru/seller/92351?sort=newly&page=1"},
+    {"name": "ЦР", "url": "https://www.wildberries.ru/seller/870386?sort=newly&page=1"},
+]
+
 LIMIT = 20
 OUTPUT_XLSX = "wb_products.xlsx"
 TEMP_IMG_DIR = "temp_images"
@@ -55,13 +59,7 @@ def prepare_excel_image(image_path: str, max_width: int = 160, max_height: int =
         return None
 
 
-def save_to_xlsx(items: List[Dict], path: str) -> str:
-    os.makedirs(TEMP_IMG_DIR, exist_ok=True)
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Товары WB"
-
+def format_sheet(ws):
     headers = ["Наименование", "Категория", "Картинка", "Ссылка"]
     ws.append(headers)
 
@@ -78,6 +76,8 @@ def save_to_xlsx(items: List[Dict], path: str) -> str:
     ws.column_dimensions["C"].width = 28
     ws.column_dimensions["D"].width = 60
 
+
+def fill_sheet(ws, items: List[Dict], sheet_prefix: str):
     current_row = 2
 
     for idx, item in enumerate(items, start=1):
@@ -95,7 +95,7 @@ def save_to_xlsx(items: List[Dict], path: str) -> str:
 
         image_url = item.get("image")
         if image_url:
-            raw_path = os.path.join(TEMP_IMG_DIR, f"img_{idx}.jpg")
+            raw_path = os.path.join(TEMP_IMG_DIR, f"{sheet_prefix}_img_{idx}.jpg")
             downloaded = download_image(image_url, raw_path)
 
             if downloaded:
@@ -109,6 +109,24 @@ def save_to_xlsx(items: List[Dict], path: str) -> str:
 
         ws.row_dimensions[current_row].height = 130
         current_row += 1
+
+
+def save_to_xlsx(sellers_data: Dict[str, List[Dict]], path: str) -> str:
+    os.makedirs(TEMP_IMG_DIR, exist_ok=True)
+
+    wb = Workbook()
+    first_sheet = True
+
+    for sheet_name, items in sellers_data.items():
+        if first_sheet:
+            ws = wb.active
+            ws.title = sheet_name
+            first_sheet = False
+        else:
+            ws = wb.create_sheet(title=sheet_name)
+
+        format_sheet(ws)
+        fill_sheet(ws, items, sheet_name)
 
     wb.save(path)
     return path
@@ -176,8 +194,7 @@ async def get_text_by_selectors(page, selectors: List[str]) -> Optional[str]:
     for selector in selectors:
         try:
             locator = page.locator(selector).first
-            count = await locator.count()
-            if count > 0:
+            if await locator.count() > 0:
                 text = await locator.inner_text()
                 text = " ".join(text.split())
                 if text:
@@ -191,8 +208,7 @@ async def get_image_by_selectors(page, selectors: List[str]) -> Optional[str]:
     for selector in selectors:
         try:
             locator = page.locator(selector).first
-            count = await locator.count()
-            if count > 0:
+            if await locator.count() > 0:
                 src = await locator.get_attribute("src")
                 current_src = await locator.get_attribute("currentSrc")
                 candidate = current_src or src
@@ -209,16 +225,16 @@ async def get_image_by_selectors(page, selectors: List[str]) -> Optional[str]:
 
 async def parse_product_page(context, url: str) -> Dict:
     page = await context.new_page()
-    page.set_default_timeout(15000)
+    page.set_default_timeout(10000)
 
     try:
         logger.info("Открываю карточку: %s", url)
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(2500)
+        await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        await page.wait_for_timeout(2000)
 
         title = None
         try:
-            await page.wait_for_selector("h3", timeout=5000)
+            await page.wait_for_selector("h3", timeout=4000)
             title = await page.locator("h3").first.inner_text()
             title = " ".join(title.split())
         except Exception:
@@ -243,7 +259,7 @@ async def parse_product_page(context, url: str) -> Dict:
 
         category = None
         try:
-            await page.wait_for_selector("span.categoryLinkCategory--VSJ8c", timeout=5000)
+            await page.wait_for_selector("span.categoryLinkCategory--VSJ8c", timeout=4000)
             category = await page.locator("span.categoryLinkCategory--VSJ8c").first.inner_text()
             category = " ".join(category.split())
         except Exception:
@@ -299,7 +315,66 @@ async def parse_product_page(context, url: str) -> Dict:
         await page.close()
 
 
-async def scrape_products(progress_callback=None) -> List[Dict]:
+async def safe_parse_product_page(context, url: str, idx: int) -> Optional[Dict]:
+    try:
+        item = await asyncio.wait_for(parse_product_page(context, url), timeout=20)
+
+        if idx == 1 and (
+            item.get("category") == "Категория не найдена"
+            or item.get("title", "").startswith("Товар ")
+        ):
+            await asyncio.sleep(1.5)
+            item = await asyncio.wait_for(parse_product_page(context, url), timeout=20)
+
+        return item
+
+    except asyncio.TimeoutError:
+        logger.warning("Таймаут на карточке: %s", url)
+        return None
+    except Exception as e:
+        logger.warning("Ошибка карточки %s: %s", url, e)
+        return None
+
+
+async def scrape_one_seller(context, seller_url: str, seller_name: str, progress_callback=None) -> List[Dict]:
+    seller_page = await context.new_page()
+    seller_page.set_default_timeout(15000)
+
+    try:
+        if progress_callback:
+            await progress_callback(f"{seller_name}: открываю страницу продавца...")
+
+        await seller_page.goto(seller_url, wait_until="domcontentloaded", timeout=30000)
+        await seller_page.wait_for_timeout(4000)
+
+        product_links = await collect_product_links(seller_page, LIMIT)
+
+        if not product_links:
+            raise RuntimeError(f"{seller_name}: не удалось собрать ссылки на товары")
+
+        if progress_callback:
+            await progress_callback(f"{seller_name}: найдено ссылок {len(product_links)}. Читаю карточки...")
+
+        results = []
+
+        for index, url in enumerate(product_links[:LIMIT], start=1):
+            item = await safe_parse_product_page(context, url, index)
+
+            if item:
+                results.append(item)
+
+            if progress_callback:
+                await progress_callback(f"{seller_name}: обработано {index}/{min(len(product_links), LIMIT)}")
+
+            await asyncio.sleep(0.4)
+
+        return results
+
+    finally:
+        await seller_page.close()
+
+
+async def scrape_all_sellers(progress_callback=None) -> Dict[str, List[Dict]]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -320,57 +395,27 @@ async def scrape_products(progress_callback=None) -> List[Dict]:
             locale="ru-RU",
         )
 
-        seller_page = await context.new_page()
-        seller_page.set_default_timeout(15000)
-
         try:
-            if progress_callback:
-                await progress_callback("Открываю страницу продавца...")
+            result = {}
 
-            await seller_page.goto(SELLER_URL, wait_until="domcontentloaded", timeout=30000)
-            await seller_page.wait_for_timeout(4000)
+            for seller in SELLERS:
+                items = await scrape_one_seller(
+                    context,
+                    seller["url"],
+                    seller["name"],
+                    progress_callback=progress_callback
+                )
+                result[seller["name"]] = items
 
-            product_links = await collect_product_links(seller_page, LIMIT)
-
-            if not product_links:
-                raise RuntimeError("Не удалось собрать ссылки на товары")
-
-            if progress_callback:
-                await progress_callback(f"Найдено ссылок: {len(product_links)}. Читаю карточки...")
-
-            results = []
-
-            for index, url in enumerate(product_links[:LIMIT], start=1):
-                try:
-                    item = await parse_product_page(context, url)
-
-                    if index == 1 and (
-                        item.get("category") == "Категория не найдена"
-                        or item.get("title", "").startswith("Товар ")
-                    ):
-                        await asyncio.sleep(1.5)
-                        item = await parse_product_page(context, url)
-
-                    results.append(item)
-
-                    if progress_callback and index in (1, 5, 10, 15, 20):
-                        await progress_callback(f"Обработано товаров: {index}/{min(len(product_links), LIMIT)}")
-
-                    await asyncio.sleep(0.5)
-
-                except Exception as e:
-                    logger.warning("Не удалось обработать %s: %s", url, e)
-
-            return results
+            return result
 
         finally:
-            await seller_page.close()
             await context.close()
             await browser.close()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Напиши /novinki и я пришлю Excel-файл")
+    await update.message.reply_text("Напиши /novinki и я пришлю Excel-файл с листами МС и ЦР")
 
 
 async def novinki(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -383,28 +428,33 @@ async def novinki(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     try:
-        items = await asyncio.wait_for(scrape_products(progress_callback=progress), timeout=240)
+        sellers_data = await asyncio.wait_for(scrape_all_sellers(progress_callback=progress), timeout=600)
 
-        if not items:
-            await status_msg.edit_text("Не удалось найти товары.")
+        total_items = sum(len(items) for items in sellers_data.values())
+        if total_items == 0:
+            await status_msg.edit_text("Не удалось собрать данные по товарам.")
             return
 
-        await status_msg.edit_text(f"Собрано {len(items)} товаров. Формирую Excel...")
+        await status_msg.edit_text("Формирую Excel...")
 
-        file_path = save_to_xlsx(items, OUTPUT_XLSX)
+        file_path = save_to_xlsx(sellers_data, OUTPUT_XLSX)
 
         with open(file_path, "rb") as f:
             await update.message.reply_document(
                 document=f,
                 filename="wb_products.xlsx",
-                caption=f"Готово: {len(items)} товаров"
+                caption=(
+                    f"Готово:\n"
+                    f"МС — {len(sellers_data.get('МС', []))} товаров\n"
+                    f"ЦР — {len(sellers_data.get('ЦР', []))} товаров"
+                )
             )
 
         await status_msg.edit_text("Готово.")
 
     except asyncio.TimeoutError:
-        logger.exception("Таймаут парсинга")
-        await status_msg.edit_text("Ошибка: парсинг завис по таймауту.")
+        logger.exception("Общий таймаут парсинга")
+        await status_msg.edit_text("Ошибка: общий таймаут парсинга.")
     except Exception as e:
         logger.exception("Ошибка")
         await status_msg.edit_text(f"Ошибка: {e}")
