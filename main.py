@@ -4,10 +4,9 @@ import asyncio
 import logging
 from typing import List, Dict, Optional
 
-import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 TG_TOKEN = os.getenv("TG_BOT_TOKEN")
 
@@ -25,47 +24,99 @@ def extract_nm_id(url: str) -> Optional[int]:
     return None
 
 
-def build_image_url(nm_id: int):
+def build_image_url(nm_id: int) -> str:
     vol = nm_id // 100000
     part = nm_id // 1000
     return f"https://basket-01.wbbasket.ru/vol{vol}/part{part}/{nm_id}/images/big/1.webp"
 
 
-async def scrape_products():
+async def scrape_products() -> List[Dict]:
     results: List[Dict] = []
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-
-        await page.goto(SELLER_URL)
-        await page.wait_for_timeout(5000)
-
-        links = await page.locator("a[href*='/catalog/']").evaluate_all(
-            "els => els.map(e => e.href)"
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
         )
 
-        seen = set()
+        context = await browser.new_context(
+            viewport={"width": 1440, "height": 2200},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+            locale="ru-RU",
+        )
 
-        for href in links:
-            nm = extract_nm_id(href)
-            if not nm or nm in seen:
-                continue
+        page = await context.new_page()
+        page.set_default_timeout(20000)
 
-            seen.add(nm)
+        try:
+            logger.info("Открываю страницу продавца")
+            await page.goto(SELLER_URL, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(5000)
 
-            results.append({
-                "nm_id": nm,
-                "url": href,
-                "image": build_image_url(nm)
-            })
+            selectors = [
+                "a.product-card__link",
+                "article a[href*='/catalog/'][href*='/detail.aspx']",
+                "a[href*='/catalog/'][href*='/detail.aspx']",
+            ]
 
-            if len(results) >= LIMIT:
-                break
+            found_selector = None
+            for selector in selectors:
+                try:
+                    await page.wait_for_selector(selector, timeout=8000)
+                    found_selector = selector
+                    logger.info("Найден селектор: %s", selector)
+                    break
+                except PlaywrightTimeoutError:
+                    logger.info("Селектор не найден: %s", selector)
 
-        await browser.close()
+            if not found_selector:
+                html_preview = await page.content()
+                raise RuntimeError(
+                    "Карточки товаров не найдены на странице. "
+                    f"Длина HTML: {len(html_preview)}"
+                )
 
-    return results
+            for _ in range(4):
+                await page.mouse.wheel(0, 2500)
+                await page.wait_for_timeout(1200)
+
+            links = await page.locator("a[href*='/catalog/'][href*='/detail.aspx']").evaluate_all(
+                """elements => elements.map(el => el.href).filter(Boolean)"""
+            )
+
+            logger.info("Найдено ссылок: %s", len(links))
+
+            seen = set()
+
+            for href in links:
+                nm_id = extract_nm_id(href)
+                if not nm_id or nm_id in seen:
+                    continue
+
+                seen.add(nm_id)
+                results.append({
+                    "nm_id": nm_id,
+                    "url": href,
+                    "image": build_image_url(nm_id),
+                })
+
+                if len(results) >= LIMIT:
+                    break
+
+            logger.info("Собрано товаров: %s", len(results))
+            return results
+
+        finally:
+            await context.close()
+            await browser.close()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -73,25 +124,42 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def novinki(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status_msg = await update.message.reply_text("Собираю товары...")
 
-    await update.message.reply_text("Собираю товары...")
+    try:
+        await status_msg.edit_text("Открываю страницу магазина...")
+        items = await asyncio.wait_for(scrape_products(), timeout=90)
 
-    items = await scrape_products()
+        if not items:
+            await status_msg.edit_text("Не удалось найти товары на странице продавца.")
+            return
 
-    for i, item in enumerate(items, 1):
+        await status_msg.edit_text(f"Нашёл {len(items)} товаров, отправляю...")
 
-        text = f"{i}. {item['url']}"
+        for i, item in enumerate(items, 1):
+            text = f"{i}. {item['url']}"
 
-        await update.message.reply_photo(
-            photo=item["image"],
-            caption=text
-        )
+            try:
+                await update.message.reply_photo(
+                    photo=item["image"],
+                    caption=text
+                )
+            except Exception:
+                await update.message.reply_text(text)
 
-        await asyncio.sleep(0.6)
+            await asyncio.sleep(0.6)
+
+        await status_msg.edit_text("Готово.")
+
+    except asyncio.TimeoutError:
+        logger.exception("Таймаут парсинга")
+        await status_msg.edit_text("Ошибка: парсинг завис по таймауту.")
+    except Exception as e:
+        logger.exception("Ошибка парсинга")
+        await status_msg.edit_text(f"Ошибка: {e}")
 
 
 def main():
-
     if not TG_TOKEN:
         raise RuntimeError("Добавь TG_BOT_TOKEN в Railway Variables")
 
@@ -100,8 +168,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("novinki", novinki))
 
-    print("Bot started")
-
+    logger.info("Bot started")
     app.run_polling()
 
 
