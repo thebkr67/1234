@@ -128,14 +128,12 @@ async def collect_product_links(page, limit: int) -> List[str]:
     if not found_selector:
         raise RuntimeError("На странице продавца не найдены карточки товаров")
 
-    # сначала собираем ссылки без скролла, чтобы не потерять первый товар
     initial_links = await page.locator("a[href*='/catalog/'][href*='/detail.aspx']").evaluate_all(
         """elements => elements.map(el => el.href).filter(Boolean)"""
     )
 
     collected_links = list(initial_links)
 
-    # потом дособираем после скролла
     for _ in range(5):
         await page.mouse.wheel(0, 2800)
         await page.wait_for_timeout(1200)
@@ -214,49 +212,59 @@ async def parse_product_page(context, url: str) -> Dict:
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(3000)
 
-        # Наименование строго из h3
-title = None
+        title = None
+        try:
+            await page.wait_for_selector("h3", timeout=7000)
+            title = await page.locator("h3").first.inner_text()
+            title = " ".join(title.split())
+        except Exception:
+            pass
 
-try:
-    await page.wait_for_selector("h3", timeout=7000)
-    title = await page.locator("h3").first.inner_text()
-    title = " ".join(title.split())
-except:
-    pass
+        if not title:
+            title = await get_text_by_selectors(page, [
+                "h3",
+                ".product-page h3",
+                "[class*='product'] h3",
+            ])
 
-# fallback если h3 не появился
-if not title:
-    try:
-        html = await page.content()
-        match = re.search(r"<h3[^>]*>(.*?)</h3>", html)
-        if match:
-            title = re.sub("<.*?>", "", match.group(1)).strip()
-    except:
-        pass
+        if not title:
+            try:
+                html = await page.content()
+                match = re.search(r"<h3[^>]*>(.*?)</h3>", html, re.S)
+                if match:
+                    title = re.sub(r"<.*?>", "", match.group(1)).strip()
+                    title = " ".join(title.split())
+            except Exception:
+                pass
 
-category = None
+        category = None
+        try:
+            await page.wait_for_selector("span.categoryLinkCategory--VSJ8c", timeout=7000)
+            category = await page.locator("span.categoryLinkCategory--VSJ8c").first.inner_text()
+            category = " ".join(category.split())
+        except Exception:
+            pass
 
-try:
-    await page.wait_for_selector("span.categoryLinkCategory--VSJ8c", timeout=7000)
-    category = await page.locator("span.categoryLinkCategory--VSJ8c").first.inner_text()
-    category = " ".join(category.split())
-except:
-    pass
+        if not category:
+            category = await get_text_by_selectors(page, [
+                "span.categoryLinkCategory--VSJ8c",
+                "span[class*='categoryLinkCategory']",
+            ])
 
-# fallback через HTML
-if not category:
-    try:
-        html = await page.content()
-        match = re.search(
-            r'class="categoryLinkCategory--VSJ8c">(.*?)</span>',
-            html
-        )
-        if match:
-            category = match.group(1).strip()
-    except:
-        pass
+        if not category:
+            try:
+                html = await page.content()
+                match = re.search(
+                    r'class="categoryLinkCategory--VSJ8c">(.*?)</span>',
+                    html,
+                    re.S
+                )
+                if match:
+                    category = re.sub(r"<.*?>", "", match.group(1)).strip()
+                    category = " ".join(category.split())
+            except Exception:
+                pass
 
-        # Картинка
         image = await get_image_by_selectors(page, [
             ".swiper-slide-active img",
             ".product-page__slider img",
@@ -332,9 +340,11 @@ async def scrape_products() -> List[Dict]:
                 try:
                     item = await parse_product_page(context, url)
 
-                    # для первого товара даем чуть больше времени на догрузку категории
-                    if index == 1 and item.get("category") == "Категория не найдена":
-                        logger.info("Повторная попытка для категории первого товара")
+                    if index == 1 and (
+                        item.get("category") == "Категория не найдена"
+                        or item.get("title", "").startswith("Товар ")
+                    ):
+                        logger.info("Повторная попытка для первого товара")
                         await asyncio.sleep(2)
                         item = await parse_product_page(context, url)
 
