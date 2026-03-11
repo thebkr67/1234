@@ -8,7 +8,6 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
 
 import requests
-from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
