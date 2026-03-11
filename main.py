@@ -1,6 +1,5 @@
 import os
 import re
-import io
 import asyncio
 import logging
 from typing import List, Dict, Optional
@@ -12,7 +11,6 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.drawing.image import Image as XLImage
-from openpyxl.utils import get_column_letter
 from PIL import Image as PILImage
 
 TG_TOKEN = os.getenv("TG_BOT_TOKEN")
@@ -132,20 +130,36 @@ async def collect_product_links(page, limit: int) -> List[str]:
     if not found_selector:
         raise RuntimeError("На странице продавца не найдены карточки товаров")
 
+    # сначала собираем ссылки без скролла, чтобы не потерять первый товар
+    initial_links = await page.locator("a[href*='/catalog/'][href*='/detail.aspx']").evaluate_all(
+        """elements => elements.map(el => el.href).filter(Boolean)"""
+    )
+
+    collected_links = list(initial_links)
+
+    # потом дособираем после скролла
     for _ in range(5):
         await page.mouse.wheel(0, 2800)
         await page.wait_for_timeout(1200)
 
-    links = await page.locator("a[href*='/catalog/'][href*='/detail.aspx']").evaluate_all(
-        """elements => elements.map(el => el.href).filter(Boolean)"""
-    )
+        new_links = await page.locator("a[href*='/catalog/'][href*='/detail.aspx']").evaluate_all(
+            """elements => elements.map(el => el.href).filter(Boolean)"""
+        )
+
+        collected_links.extend(new_links)
+
+        if len(collected_links) >= limit * 3:
+            break
 
     result = []
     seen = set()
 
-    for href in links:
+    for href in collected_links:
         nm_id = extract_nm_id(href)
-        if not nm_id or nm_id in seen:
+        if not nm_id:
+            continue
+
+        if nm_id in seen:
             continue
 
         seen.add(nm_id)
@@ -153,6 +167,10 @@ async def collect_product_links(page, limit: int) -> List[str]:
 
         if len(result) >= limit:
             break
+
+    logger.info("Итоговое количество уникальных ссылок: %s", len(result))
+    if result:
+        logger.info("Первая ссылка: %s", result[0])
 
     return result
 
@@ -199,20 +217,17 @@ async def parse_product_page(context, url: str) -> Dict:
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(3000)
 
-        # Наименование строго из h3
         title = await get_text_by_selectors(page, [
             "h3",
             ".product-page h3",
             "[class*='product'] h3",
         ])
 
-        # Категория строго из span.categoryLinkCategory--VSJ8c
         category = await get_text_by_selectors(page, [
             "span.categoryLinkCategory--VSJ8c",
             "[class*='categoryLinkCategory']",
         ])
 
-        # Картинка товара
         image = await get_image_by_selectors(page, [
             ".swiper-slide-active img",
             ".product-page__slider img",
