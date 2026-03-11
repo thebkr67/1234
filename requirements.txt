@@ -1,4 +1,2 @@
-python-telegram-bot==20.7
-aiohttp
-beautifulsoup4
-openpyxl
+python-telegram-bot>=22.6,<23
+requests>=2.31.0

@@ -1,241 +1,266 @@
-import asyncio
-import aiohttp
-from telegram import Update, InputFile
-from telegram.ext import Application, CommandHandler, ContextTypes
-from bs4 import BeautifulSoup
-import logging
-import io
-import re
 import os
-from openpyxl import Workbook
-from openpyxl.utils import get_column_letter
+import time
+import logging
+from typing import Any, Dict, List, Optional
 
-# Настройка логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+import requests
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# Конфигурация
-# Рекомендуется хранить токен в переменной окружения BOT_TOKEN
-TOKEN = os.getenv("BOT_TOKEN", "ВАШ_TELEGRAM_BOT_TOKEN")
+TOKEN = os.getenv("TG_BOT_TOKEN") or "PASTE_YOUR_BOT_TOKEN_HERE"
 
-SELLER_URLS = [
-    "https://www.wildberries.ru/seller/92351",
-    "https://www.wildberries.ru/seller/870386?sort=newly&page=1"
-]
+SELLER_ID = 92351
+PAGE = 1
+LIMIT = 20
+
+WB_SEARCH_URL = "https://search.wb.ru/exactmatch/ru/common/v13/search"
+WB_CARD_URL = "https://card.wb.ru/cards/v2/detail"
 
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-    'Accept-Language': 'ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-    'Cache-Control': 'max-age=0'
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Referer": f"https://www.wildberries.ru/seller/{SELLER_ID}?sort=newly&page={PAGE}",
 }
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("wb_bot")
 
-async def parse_wildberries(session: aiohttp.ClientSession, url: str):
-    """Парсинг товаров с одной страницы продавца (HTML).
-    Важно: WB часто подгружает товары через API. Если товаров не находит — лучше перейти на API-парсинг.
-    """
-    products = []
 
+def safe_get(dct: Dict[str, Any], *keys, default=None):
+    cur = dct
+    for key in keys:
+        if isinstance(cur, dict) and key in cur:
+            cur = cur[key]
+        else:
+            return default
+    return cur
+
+
+def extract_products_from_search_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    candidates = [
+        safe_get(payload, "data", "products", default=[]),
+        safe_get(payload, "products", default=[]),
+        safe_get(payload, "data", "cards", default=[]),
+        safe_get(payload, "cards", default=[]),
+        safe_get(payload, "data", "catalog", "products", default=[]),
+    ]
+    for item in candidates:
+        if isinstance(item, list) and item:
+            return item
+    return []
+
+
+def extract_title(product: Dict[str, Any]) -> str:
+    return (
+        product.get("name")
+        or product.get("title")
+        or product.get("imt_name")
+        or product.get("goodsName")
+        or "Без названия"
+    )
+
+
+def extract_category(product: Dict[str, Any]) -> str:
+    return (
+        product.get("subject")
+        or product.get("subjectName")
+        or product.get("entity")
+        or product.get("category")
+        or product.get("root")
+        or "Категория не найдена"
+    )
+
+
+def get_nm_id(product: Dict[str, Any]) -> Optional[int]:
+    nm = product.get("id") or product.get("nmId") or product.get("nmID")
     try:
-        async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=25)) as response:
-            if response.status == 200:
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
-
-                # Поиск карточек товаров (селекторы могут меняться)
-                product_cards = soup.find_all('div', {'class': re.compile(r'product-card')})
-                if not product_cards:
-                    product_cards = soup.find_all('article', {'class': re.compile(r'product-card')})
-
-                for card in product_cards:
-                    try:
-                        # Название
-                        name_elem = (
-                            card.find('span', {'class': re.compile(r'product-name')}) or
-                            card.find('a', {'class': re.compile(r'product-name')}) or
-                            card.find('h3')
-                        )
-                        product_name = name_elem.get_text(strip=True) if name_elem else "Название не найдено"
-
-                        # Картинка
-                        img_elem = (
-                            card.find('img', {'class': re.compile(r'thumbnail')}) or
-                            card.find('img', {'class': re.compile(r'product-image')}) or
-                            card.find('img')
-                        )
-
-                        img_url = ""
-                        if img_elem:
-                            # WB может отдавать src, data-src, srcset
-                            if img_elem.get('src'):
-                                img_url = img_elem['src']
-                            elif img_elem.get('data-src'):
-                                img_url = img_elem['data-src']
-                            elif img_elem.get('srcset'):
-                                # берем первый url из srcset
-                                img_url = img_elem['srcset'].split(',')[0].strip().split(' ')[0]
-
-                        if img_url:
-                            if img_url.startswith('//'):
-                                img_url = 'https:' + img_url
-                            elif img_url.startswith('/'):
-                                img_url = 'https://www.wildberries.ru' + img_url
-                        else:
-                            img_url = "Изображение не найдено"
-
-                        products.append({
-                            'Наименование': product_name,
-                            'Картинка': img_url,
-                            'Источник': url
-                        })
-
-                    except Exception as e:
-                        logger.error(f"Ошибка при парсинге карточки: {e}")
-                        continue
-
-                logger.info(f"Найдено {len(products)} товаров с {url}")
-            else:
-                logger.error(f"Ошибка HTTP {response.status} для {url}")
-
-    except Exception as e:
-        logger.error(f"Ошибка при запросе к {url}: {e}")
-
-    return products
-
-
-async def parse_all_sellers():
-    """Парсинг всех продавцов"""
-    all_products = []
-    async with aiohttp.ClientSession() as session:
-        tasks = [parse_wildberries(session, url) for url in SELLER_URLS]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for r in results:
-            if isinstance(r, Exception):
-                logger.error(f"Ошибка задачи парсинга: {r}")
-                continue
-            all_products.extend(r)
-
-    return all_products
-
-
-def create_excel(products):
-    """Создание Excel файла с товарами (без pandas — чтобы не падало из-за отсутствия зависимости)."""
-    if not products:
+        return int(nm) if nm is not None else None
+    except Exception:
         return None
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Товары"
 
-    headers = ["Наименование", "Картинка", "Источник"]
-    ws.append(headers)
-
-    for p in products:
-        ws.append([p.get("Наименование", ""), p.get("Картинка", ""), p.get("Источник", "")])
-
-    # Ширина колонок
-    widths = [50, 60, 40]
-    for idx, w in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(idx)].width = w
-
-    # Сохраняем в память
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
-    return output
+def build_wb_image_url(nm_id: int, image_index: int = 1) -> str:
+    vol = nm_id // 100000
+    part = nm_id // 1000
+    return f"https://basket-01.wbbasket.ru/vol{vol}/part{part}/{nm_id}/images/big/{image_index}.webp"
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
-    welcome_text = (
-        "👋 Привет! Я бот для парсинга товаров с Wildberries.\n\n"
-        "Доступные команды:\n"
-        "/start — Показать это сообщение\n"
-        "/parse — Начать парсинг товаров\n"
-        "/help — Помощь\n\n"
-        "Я соберу данные с продавцов и отправлю Excel-файл."
+def find_image_url_in_product(product: Dict[str, Any]) -> Optional[str]:
+    for key in ["image", "img", "imageUrl", "image_url", "thumb", "photo"]:
+        val = product.get(key)
+        if isinstance(val, str) and val.startswith("http"):
+            return val
+
+    for key in ["images", "photos", "mediaFiles"]:
+        val = product.get(key)
+        if isinstance(val, list) and val:
+            first = val[0]
+            if isinstance(first, str) and first.startswith("http"):
+                return first
+            if isinstance(first, dict):
+                for subkey in ["big", "original", "url", "img", "image"]:
+                    v = first.get(subkey)
+                    if isinstance(v, str) and v.startswith("http"):
+                        return v
+    return None
+
+
+def get_card_detail(nm_id: int) -> Optional[Dict[str, Any]]:
+    params = {
+        "appType": 1,
+        "curr": "rub",
+        "dest": -1257786,
+        "spp": 30,
+        "nm": nm_id,
+    }
+    try:
+        resp = requests.get(WB_CARD_URL, params=params, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+
+        for path in [
+            ("data", "products"),
+            ("products",),
+            ("data", "cards"),
+            ("cards",),
+        ]:
+            node = data
+            ok = True
+            for p in path:
+                if isinstance(node, dict) and p in node:
+                    node = node[p]
+                else:
+                    ok = False
+                    break
+            if ok and isinstance(node, list) and node:
+                return node[0]
+    except Exception as e:
+        logger.warning("Не удалось получить detail для nm_id=%s: %s", nm_id, e)
+    return None
+
+
+def extract_main_image(product: Dict[str, Any], nm_id: Optional[int]) -> Optional[str]:
+    direct = find_image_url_in_product(product)
+    if direct:
+        return direct
+
+    if nm_id:
+        detail = get_card_detail(nm_id)
+        if detail:
+            direct_detail = find_image_url_in_product(detail)
+            if direct_detail:
+                return direct_detail
+        return build_wb_image_url(nm_id, 1)
+
+    return None
+
+
+def fetch_new_products_from_seller(
+    seller_id: int,
+    page: int = 1,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    params = {
+        "ab_testing": "false",
+        "appType": 1,
+        "curr": "rub",
+        "dest": -1257786,
+        "hide_dtype": 13,
+        "lang": "ru",
+        "page": page,
+        "query": "",
+        "resultset": "catalog",
+        "sort": "newly",
+        "spp": 30,
+        "supplier": seller_id,
+    }
+
+    resp = requests.get(WB_SEARCH_URL, params=params, headers=HEADERS, timeout=25)
+    resp.raise_for_status()
+    payload = resp.json()
+
+    raw_products = extract_products_from_search_payload(payload)
+    result = []
+
+    for product in raw_products[:limit]:
+        nm_id = get_nm_id(product)
+        title = extract_title(product)
+        category = extract_category(product)
+        image = extract_main_image(product, nm_id)
+
+        result.append({
+            "nm_id": nm_id,
+            "title": title,
+            "name": title,
+            "category": category,
+            "image": image,
+            "url": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx" if nm_id else None,
+        })
+
+        time.sleep(0.15)
+
+    return result
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Привет! Я парсю новинки магазина WB.\n\nКоманды:\n/novinki - показать 20 новинок продавца 92351"
     )
-    await update.message.reply_text(welcome_text)
 
 
-async def parse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /parse"""
-    await update.message.reply_text("🔄 Начинаю парсинг товаров с Wildberries...")
+async def novinki(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Собираю 20 новинок магазина...")
 
     try:
-        products = await parse_all_sellers()
+        items = fetch_new_products_from_seller(seller_id=SELLER_ID, page=PAGE, limit=LIMIT)
 
-        if not products:
+        if not items:
             await update.message.reply_text(
-                "❌ Не удалось найти товары.\n"
-                "Возможные причины:\n"
-                "• Wildberries изменил структуру HTML\n"
-                "• товары подгружаются через API\n"
-                "• временная блокировка/капча\n\n"
-                "Если нужно — перепишу парсер на API (самый надежный вариант)."
+                "Не удалось получить товары. Возможно, WB поменял структуру ответа или магазин сейчас не отдает выдачу."
             )
             return
 
-        await update.message.reply_text(f"✅ Найдено {len(products)} товаров. Формирую Excel-файл...")
-        excel_file = create_excel(products)
-
-        if excel_file:
-            await update.message.reply_document(
-                document=InputFile(excel_file, filename="wildberries_products.xlsx"),
-                caption=f"📊 Файл с {len(products)} товарами"
+        for i, item in enumerate(items, start=1):
+            text = (
+                f"{i}. {item['title']}\n"
+                f"Категория: {item['category']}\n"
+                f"nmID: {item['nm_id']}\n"
+                f"Карточка: {item['url']}"
             )
-        else:
-            await update.message.reply_text("❌ Ошибка при создании файла.")
+
+            image_url = item.get("image")
+            if image_url:
+                try:
+                    await update.message.reply_photo(photo=image_url, caption=text)
+                    continue
+                except Exception as e:
+                    logger.warning("Не удалось отправить фото %s: %s", image_url, e)
+
+            await update.message.reply_text(text)
 
     except Exception as e:
-        logger.error(f"Ошибка при парсинге: {e}")
-        await update.message.reply_text(f"❌ Произошла ошибка: {str(e)}")
+        logger.exception("Ошибка в /novinki")
+        await update.message.reply_text(f"Ошибка при парсинге: {e}")
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /help"""
-    help_text = (
-        "📚 Помощь по использованию бота:\n\n"
-        "1) /parse — запускает парсинг товаров с Wildberries\n"
-        "2) Бот собирает данные с продавцов из списка SELLER_URLS\n"
-        "3) Результат отправляется в Excel с колонками:\n"
-        "   • Наименование\n"
-        "   • Ссылка на картинку\n"
-        "   • Источник (URL продавца)\n\n"
-        "⚠️ Если парсинг не работает, WB мог изменить структуру сайта — тогда лучше парсить через API."
-    )
-    await update.message.reply_text(help_text)
-
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик ошибок"""
-    logger.error(f"Ошибка: {context.error}")
-    if update and update.message:
-        await update.message.reply_text("❌ Произошла ошибка. Попробуйте позже.")
-
-
-def main():
-    """Основная функция запуска бота"""
-    if not TOKEN or TOKEN == "ВАШ_TELEGRAM_BOT_TOKEN":
-        logger.warning("⚠️ Не задан BOT_TOKEN. Установите переменную окружения BOT_TOKEN или пропишите TOKEN в коде.")
+def main() -> None:
+    if not TOKEN or TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
+        raise RuntimeError("Укажи токен в переменной окружения TG_BOT_TOKEN или в TOKEN")
 
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("parse", parse_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_error_handler(error_handler)
+    application.add_handler(CommandHandler("novinki", novinki))
 
-    logger.info("Бот запущен...")
-    application.run_polling(allowed_updates=Update.ALL_UPDATES)
+    logger.info("Бот запущен")
+    application.run_polling()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
