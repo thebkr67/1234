@@ -1,5 +1,6 @@
 import os
 import time
+import random
 import logging
 import requests
 
@@ -20,14 +21,16 @@ HEADERS = {
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("wb_bot")
 
+SESSION = requests.Session()
 
-def build_image_url(nm_id: int) -> str:
+
+def build_image_url(nm_id):
     vol = nm_id // 100000
     part = nm_id // 1000
     return f"https://basket-01.wbbasket.ru/vol{vol}/part{part}/{nm_id}/images/big/1.webp"
 
 
-def fetch_products():
+def request_with_retry():
 
     params = {
         "appType": 1,
@@ -41,30 +44,37 @@ def fetch_products():
         "spp": 30,
     }
 
-    response = requests.get(
-        SEARCH_URL,
-        params=params,
-        headers=HEADERS,
-        timeout=20,
-    )
+    for attempt in range(5):
 
-    if response.status_code == 429:
-        raise RuntimeError("WB ограничил запросы (429). Попробуй позже.")
+        response = SESSION.get(
+            SEARCH_URL,
+            params=params,
+            headers=HEADERS,
+            timeout=20
+        )
 
-    response.raise_for_status()
+        if response.status_code == 429:
 
-    content_type = response.headers.get("Content-Type", "").lower()
+            sleep_time = random.uniform(5, 10)
 
-    if "application/json" not in content_type:
-        raise RuntimeError("WB вернул не JSON. Возможно временная защита.")
+            logger.warning(f"WB вернул 429, жду {sleep_time:.1f} сек")
 
-    data = response.json()
+            time.sleep(sleep_time)
 
-    products = (
-        data.get("data", {}).get("products")
-        or data.get("products")
-        or []
-    )
+            continue
+
+        response.raise_for_status()
+
+        return response.json()
+
+    raise RuntimeError("WB долго блокирует запросы (429)")
+
+
+def fetch_products():
+
+    data = request_with_retry()
+
+    products = data.get("data", {}).get("products", [])
 
     if not products:
         raise RuntimeError("WB не вернул товары")
@@ -74,9 +84,6 @@ def fetch_products():
     for p in products[:LIMIT]:
 
         nm_id = p.get("id")
-
-        if not nm_id:
-            continue
 
         result.append({
             "title": p.get("name", "Без названия"),
@@ -89,6 +96,7 @@ def fetch_products():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     await update.message.reply_text(
         "Напиши /novinki чтобы получить 20 товаров магазина"
     )
@@ -116,21 +124,19 @@ async def novinki(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await update.message.reply_text(text)
 
-            time.sleep(0.5)
+            time.sleep(random.uniform(0.5, 1.2))
 
     except Exception as e:
 
-        logger.exception("Ошибка парсинга")
+        logger.exception("Ошибка")
 
-        await update.message.reply_text(
-            f"Ошибка: {e}"
-        )
+        await update.message.reply_text(f"Ошибка: {e}")
 
 
 def main():
 
     if TOKEN == "PASTE_YOUR_TELEGRAM_TOKEN":
-        raise RuntimeError("Вставь токен Telegram бота")
+        raise RuntimeError("Вставь токен Telegram")
 
     app = Application.builder().token(TOKEN).build()
 
