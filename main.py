@@ -1,20 +1,18 @@
 import os
-import time
-import random
+import re
+import asyncio
 import logging
-from typing import Any, Dict, List
+from typing import List, Dict, Optional
 
 import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-TOKEN = os.getenv("TG_BOT_TOKEN") or "PASTE_YOUR_TELEGRAM_TOKEN"
+TG_TOKEN = os.getenv("TG_BOT_TOKEN") or "PASTE_YOUR_TELEGRAM_TOKEN"
 
-SELLER_ID = 92351
+SELLER_URL = "https://www.wildberries.ru/seller/92351?sort=newly&page=1"
 LIMIT = 20
-
-# Более актуальный витринный endpoint
-SEARCH_URL = "https://u-search.wb.ru/exactmatch/ru/common/v18/search"
 
 HEADERS = {
     "User-Agent": (
@@ -27,130 +25,200 @@ HEADERS = {
     "Referer": "https://www.wildberries.ru/",
 }
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("wb_bot")
+WB_CARD_URL = "https://card.wb.ru/cards/v2/detail"
 
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("wb_browser_bot")
+
+session = requests.Session()
+session.headers.update(HEADERS)
 
 
-def build_image_url(nm_id: int) -> str:
+def extract_nm_id(url: str) -> Optional[int]:
+    match = re.search(r"/catalog/(\d+)/detail\.aspx", url)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def build_image_url(nm_id: int, image_index: int = 1) -> str:
     vol = nm_id // 100000
     part = nm_id // 1000
-    return f"https://basket-01.wbbasket.ru/vol{vol}/part{part}/{nm_id}/images/big/1.webp"
+    return f"https://basket-01.wbbasket.ru/vol{vol}/part{part}/{nm_id}/images/big/{image_index}.webp"
 
 
-def extract_products(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    candidates = [
-        data.get("data", {}).get("products", []),
-        data.get("products", []),
-        data.get("data", {}).get("cards", []),
-        data.get("cards", []),
-        data.get("data", {}).get("catalog", {}).get("products", []),
-    ]
-    for candidate in candidates:
-        if isinstance(candidate, list) and candidate:
-            return candidate
-    return []
-
-
-def request_with_retry() -> Dict[str, Any]:
+def get_card_detail(nm_id: int) -> Dict:
     params = {
-        "ab_testid": "new_benefit_sort",
         "appType": 1,
         "curr": "rub",
         "dest": -1257786,
-        "inheritFilters": "false",
-        "lang": "ru",
-        "page": 1,
-        "query": "",
-        "resultset": "catalog",
-        "sort": "newly",
         "spp": 30,
-        "supplier": SELLER_ID,
-        "suppressSpellcheck": "false",
+        "nm": nm_id,
     }
 
-    last_error = None
+    response = session.get(WB_CARD_URL, params=params, timeout=20)
+    response.raise_for_status()
+    data = response.json()
 
-    for attempt in range(1, 6):
-        try:
-            response = SESSION.get(SEARCH_URL, params=params, timeout=20)
-
-            if response.status_code == 429:
-                sleep_time = random.uniform(5, 10)
-                logger.warning("WB вернул 429, жду %.1f сек", sleep_time)
-                time.sleep(sleep_time)
-                continue
-
-            response.raise_for_status()
-
-            content_type = response.headers.get("Content-Type", "").lower()
-            if "application/json" not in content_type:
-                preview = response.text[:300].strip()
-                raise RuntimeError(
-                    f"WB вернул не JSON, а {content_type or 'неизвестный тип'}. "
-                    f"Начало ответа: {preview}"
-                )
-
-            return response.json()
-
-        except Exception as e:
-            last_error = e
-            if attempt < 5:
-                sleep_time = random.uniform(3, 7)
-                logger.warning("Попытка %s не удалась: %s. Жду %.1f сек", attempt, e, sleep_time)
-                time.sleep(sleep_time)
+    for path in [
+        ("data", "products"),
+        ("products",),
+        ("data", "cards"),
+        ("cards",),
+    ]:
+        node = data
+        ok = True
+        for key in path:
+            if isinstance(node, dict) and key in node:
+                node = node[key]
             else:
+                ok = False
                 break
+        if ok and isinstance(node, list) and node:
+            return node[0]
 
-    raise RuntimeError(f"Не удалось получить ответ от WB: {last_error}")
+    return {}
 
 
-def fetch_products() -> List[Dict[str, Any]]:
-    data = request_with_retry()
-    products = extract_products(data)
+def extract_title(detail: Dict, fallback: str = "") -> str:
+    return (
+        detail.get("name")
+        or detail.get("title")
+        or detail.get("imt_name")
+        or detail.get("goodsName")
+        or fallback
+        or "Без названия"
+    )
 
-    if not products:
-        raise RuntimeError("WB вернул JSON, но список товаров пустой")
 
-    result = []
+def extract_category(detail: Dict) -> str:
+    return (
+        detail.get("subject")
+        or detail.get("subjectName")
+        or detail.get("entity")
+        or detail.get("category")
+        or detail.get("root")
+        or "Категория не найдена"
+    )
 
-    for p in products[:LIMIT]:
-        nm_id = p.get("id") or p.get("nmId") or p.get("nmID")
-        if not nm_id:
-            continue
+
+async def scrape_20_products_from_seller(url: str, limit: int = 20) -> List[Dict]:
+    results: List[Dict] = []
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+
+        context = await browser.new_context(
+            viewport={"width": 1440, "height": 2200},
+            user_agent=HEADERS["User-Agent"],
+            locale="ru-RU",
+        )
+
+        page = await context.new_page()
 
         try:
-            nm_id = int(nm_id)
-        except Exception:
-            continue
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(5000)
 
-        title = (
-            p.get("name")
-            or p.get("title")
-            or p.get("imt_name")
-            or "Без названия"
-        )
+            selectors = [
+                "a.product-card__link",
+                "article a[href*='/catalog/'][href*='/detail.aspx']",
+                "a[href*='/catalog/'][href*='/detail.aspx']",
+            ]
 
-        category = (
-            p.get("subject")
-            or p.get("subjectName")
-            or p.get("entity")
-            or "Категория не найдена"
-        )
+            found = False
+            for selector in selectors:
+                try:
+                    await page.wait_for_selector(selector, timeout=15000)
+                    found = True
+                    break
+                except PlaywrightTimeoutError:
+                    continue
 
-        result.append({
+            if not found:
+                raise RuntimeError("На странице продавца не найдены карточки товаров")
+
+            for _ in range(4):
+                await page.mouse.wheel(0, 3000)
+                await page.wait_for_timeout(1500)
+
+            links = await page.locator("a[href*='/catalog/'][href*='/detail.aspx']").evaluate_all(
+                """elements => elements.map(el => ({
+                    href: el.href,
+                    text: (el.innerText || '').trim()
+                }))"""
+            )
+
+            seen = set()
+
+            for item in links:
+                href = item.get("href")
+                if not href:
+                    continue
+
+                nm_id = extract_nm_id(href)
+                if not nm_id or nm_id in seen:
+                    continue
+
+                seen.add(nm_id)
+
+                title_dom = " ".join((item.get("text") or "").split())
+                results.append({
+                    "nm_id": nm_id,
+                    "url": href,
+                    "title_dom": title_dom[:180] if title_dom else "",
+                })
+
+                if len(results) >= limit:
+                    break
+
+        finally:
+            await context.close()
+            await browser.close()
+
+    return results
+
+
+async def fetch_products(limit: int = 20) -> List[Dict]:
+    raw_items = await scrape_20_products_from_seller(SELLER_URL, limit=limit)
+
+    if not raw_items:
+        raise RuntimeError("Не удалось собрать товары со страницы продавца")
+
+    final_items: List[Dict] = []
+
+    for item in raw_items[:limit]:
+        nm_id = item["nm_id"]
+
+        detail = {}
+        try:
+            detail = get_card_detail(nm_id)
+        except Exception as e:
+            logger.warning("Не удалось получить detail для %s: %s", nm_id, e)
+
+        title = extract_title(detail, fallback=item.get("title_dom", ""))
+        category = extract_category(detail)
+        image = build_image_url(nm_id, 1)
+
+        final_items.append({
+            "nm_id": nm_id,
             "title": title,
             "category": category,
-            "image": build_image_url(nm_id),
-            "url": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx",
+            "image": image,
+            "url": item["url"],
         })
 
-    if not result:
-        raise RuntimeError("Из ответа WB не удалось собрать ни одного товара")
-
-    return result
+    return final_items
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -161,34 +229,40 @@ async def novinki(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Загружаю товары...")
 
     try:
-        items = fetch_products()
+        items = await fetch_products(limit=LIMIT)
 
         for i, item in enumerate(items, 1):
-            text = f"""{i}. {item['title']}
-Категория: {item['category']}
-{item['url']}"""
+            text = (
+                f"{i}. {item['title']}\n"
+                f"Категория: {item['category']}\n"
+                f"{item['url']}"
+            )
 
             try:
-                await update.message.reply_photo(photo=item["image"], caption=text)
+                await update.message.reply_photo(
+                    photo=item["image"],
+                    caption=text
+                )
             except Exception:
                 await update.message.reply_text(text)
 
-            time.sleep(random.uniform(0.5, 1.2))
+            await asyncio.sleep(0.7)
 
     except Exception as e:
-        logger.exception("Ошибка")
+        logger.exception("Ошибка парсинга")
         await update.message.reply_text(f"Ошибка: {e}")
 
 
 def main():
-    if TOKEN == "PASTE_YOUR_TELEGRAM_TOKEN":
-        raise RuntimeError("Вставь токен Telegram")
+    if TG_TOKEN == "PASTE_YOUR_TELEGRAM_TOKEN":
+        raise RuntimeError("Вставь Telegram токен в TG_TOKEN")
 
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TG_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("novinki", novinki))
 
-    print("Bot started")
+    logger.info("Bot started")
     app.run_polling()
 
 
