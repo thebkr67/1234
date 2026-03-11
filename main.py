@@ -1,20 +1,26 @@
 import os
 import re
+import io
 import asyncio
 import logging
 from typing import List, Dict, Optional
 
+import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.drawing.image import Image as XLImage
+from openpyxl.utils import get_column_letter
+from PIL import Image as PILImage
 
 TG_TOKEN = os.getenv("TG_BOT_TOKEN")
 
 SELLER_URL = "https://www.wildberries.ru/seller/92351?sort=newly&page=1"
 LIMIT = 20
 OUTPUT_XLSX = "wb_products.xlsx"
+TEMP_IMG_DIR = "temp_images"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("wb_bot")
@@ -27,20 +33,42 @@ def extract_nm_id(url: str) -> Optional[int]:
     return None
 
 
+def download_image(image_url: str, file_path: str) -> Optional[str]:
+    try:
+        response = requests.get(image_url, timeout=30)
+        response.raise_for_status()
+
+        with open(file_path, "wb") as f:
+            f.write(response.content)
+
+        return file_path
+    except Exception as e:
+        logger.warning("Не удалось скачать картинку %s: %s", image_url, e)
+        return None
+
+
+def prepare_excel_image(image_path: str, max_width: int = 160, max_height: int = 160) -> Optional[str]:
+    try:
+        img = PILImage.open(image_path)
+        img.thumbnail((max_width, max_height))
+
+        prepared_path = image_path.rsplit(".", 1)[0] + "_prepared.png"
+        img.save(prepared_path, format="PNG")
+        return prepared_path
+    except Exception as e:
+        logger.warning("Не удалось подготовить картинку %s: %s", image_path, e)
+        return None
+
+
 def save_to_xlsx(items: List[Dict], path: str) -> str:
+    os.makedirs(TEMP_IMG_DIR, exist_ok=True)
+
     wb = Workbook()
     ws = wb.active
     ws.title = "Товары WB"
 
     headers = ["Наименование", "Категория", "Картинка"]
     ws.append(headers)
-
-    for item in items:
-        ws.append([
-            item.get("title", ""),
-            item.get("category", ""),
-            item.get("image", ""),
-        ])
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(color="FFFFFF", bold=True)
@@ -51,12 +79,34 @@ def save_to_xlsx(items: List[Dict], path: str) -> str:
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
     ws.column_dimensions["A"].width = 45
-    ws.column_dimensions["B"].width = 35
-    ws.column_dimensions["C"].width = 100
+    ws.column_dimensions["B"].width = 30
+    ws.column_dimensions["C"].width = 28
 
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    current_row = 2
+
+    for idx, item in enumerate(items, start=1):
+        ws.cell(row=current_row, column=1, value=item.get("title", ""))
+        ws.cell(row=current_row, column=2, value=item.get("category", ""))
+
+        ws.cell(row=current_row, column=1).alignment = Alignment(vertical="top", wrap_text=True)
+        ws.cell(row=current_row, column=2).alignment = Alignment(vertical="top", wrap_text=True)
+
+        image_url = item.get("image")
+        if image_url:
+            raw_path = os.path.join(TEMP_IMG_DIR, f"img_{idx}.jpg")
+            downloaded = download_image(image_url, raw_path)
+
+            if downloaded:
+                prepared = prepare_excel_image(downloaded)
+                if prepared:
+                    try:
+                        img = XLImage(prepared)
+                        ws.add_image(img, f"C{current_row}")
+                    except Exception as e:
+                        logger.warning("Не удалось вставить картинку в Excel: %s", e)
+
+        ws.row_dimensions[current_row].height = 130
+        current_row += 1
 
     wb.save(path)
     return path
@@ -107,6 +157,39 @@ async def collect_product_links(page, limit: int) -> List[str]:
     return result
 
 
+async def get_text_by_selectors(page, selectors: List[str]) -> Optional[str]:
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.count() > 0:
+                text = await locator.inner_text()
+                text = " ".join(text.split())
+                if text:
+                    return text
+        except Exception:
+            continue
+    return None
+
+
+async def get_image_by_selectors(page, selectors: List[str]) -> Optional[str]:
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.count() > 0:
+                src = await locator.get_attribute("src")
+                current_src = await locator.get_attribute("currentSrc")
+                candidate = current_src or src
+                if candidate:
+                    if candidate.startswith("//"):
+                        candidate = "https:" + candidate
+                    elif candidate.startswith("/"):
+                        candidate = "https://www.wildberries.ru" + candidate
+                    return candidate
+        except Exception:
+            continue
+    return None
+
+
 async def parse_product_page(context, url: str) -> Dict:
     page = await context.new_page()
     page.set_default_timeout(20000)
@@ -116,89 +199,33 @@ async def parse_product_page(context, url: str) -> Dict:
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(3000)
 
-        # Наименование
-        title = None
-        title_selectors = [
-            "h1",
-            "h1.product-page__title",
-            ".product-page__title",
-            "[data-link='text{:product^name}']",
-        ]
+        # Наименование строго из h3
+        title = await get_text_by_selectors(page, [
+            "h3",
+            ".product-page h3",
+            "[class*='product'] h3",
+        ])
 
-        for selector in title_selectors:
-            try:
-                el = page.locator(selector).first
-                if await el.count() > 0:
-                    text = (await el.inner_text()).strip()
-                    if text:
-                        title = " ".join(text.split())
-                        break
-            except Exception:
-                continue
+        # Категория строго из span.categoryLinkCategory--VSJ8c
+        category = await get_text_by_selectors(page, [
+            "span.categoryLinkCategory--VSJ8c",
+            "[class*='categoryLinkCategory']",
+        ])
 
-        # Категория
-        category = None
-        category_selectors = [
-            "a.breadcrumbs__link",
-            ".breadcrumbs__item",
-            ".breadcrumbs a",
-        ]
-
-        breadcrumb_texts = []
-        for selector in category_selectors:
-            try:
-                nodes = page.locator(selector)
-                count = await nodes.count()
-                if count > 0:
-                    for i in range(count):
-                        txt = (await nodes.nth(i).inner_text()).strip()
-                        txt = " ".join(txt.split())
-                        if txt and txt not in breadcrumb_texts:
-                            breadcrumb_texts.append(txt)
-                    if breadcrumb_texts:
-                        break
-            except Exception:
-                continue
-
-        if breadcrumb_texts:
-            # обычно последняя крошка - товар, предпоследняя - категория
-            if len(breadcrumb_texts) >= 2:
-                category = breadcrumb_texts[-2]
-            else:
-                category = breadcrumb_texts[0]
-
-        # Картинка - берем именно src/currentSrc с товара
-        image = None
-        image_selectors = [
+        # Картинка товара
+        image = await get_image_by_selectors(page, [
             ".swiper-slide-active img",
             ".product-page__slider img",
             ".photo-zoom__preview img",
             ".j-image-container img",
             "img[src*='wbbasket']",
-        ]
+            "img",
+        ])
 
-        for selector in image_selectors:
-            try:
-                img = page.locator(selector).first
-                if await img.count() > 0:
-                    src = await img.get_attribute("src")
-                    current_src = await img.get_attribute("currentSrc")
-                    candidate = current_src or src
-                    if candidate:
-                        if candidate.startswith("//"):
-                            candidate = "https:" + candidate
-                        elif candidate.startswith("/"):
-                            candidate = "https://www.wildberries.ru" + candidate
-                        image = candidate
-                        break
-            except Exception:
-                continue
-
-        # Фолбэки
         nm_id = extract_nm_id(url)
 
-        if not title and nm_id:
-            title = f"Товар {nm_id}"
+        if not title:
+            title = f"Товар {nm_id}" if nm_id else "Без названия"
 
         if not category:
             category = "Категория не найдена"
