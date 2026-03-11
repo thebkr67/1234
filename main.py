@@ -9,7 +9,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-TG_TOKEN = os.getenv("TG_BOT_TOKEN") or "PASTE_YOUR_TELEGRAM_TOKEN"
+TG_TOKEN = os.getenv("TG_BOT_TOKEN", "PASTE_YOUR_TELEGRAM_TOKEN")
 
 SELLER_URL = "https://www.wildberries.ru/seller/92351?sort=newly&page=1"
 LIMIT = 20
@@ -255,10 +255,9 @@ async def novinki(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if TG_TOKEN == "PASTE_YOUR_TELEGRAM_TOKEN":
-        raise RuntimeError("Вставь Telegram токен в TG_TOKEN")
+        raise RuntimeError("Вставь Telegram токен в переменную TG_BOT_TOKEN")
 
     app = Application.builder().token(TG_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("novinki", novinki))
 
