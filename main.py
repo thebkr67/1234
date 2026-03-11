@@ -63,7 +63,7 @@ def save_to_xlsx(items: List[Dict], path: str) -> str:
     ws = wb.active
     ws.title = "Товары WB"
 
-    headers = ["Наименование", "Категория", "Картинка"]
+    headers = ["Наименование", "Категория", "Картинка", "Ссылка"]
     ws.append(headers)
 
     header_fill = PatternFill("solid", fgColor="1F4E78")
@@ -77,23 +77,32 @@ def save_to_xlsx(items: List[Dict], path: str) -> str:
     ws.column_dimensions["A"].width = 45
     ws.column_dimensions["B"].width = 30
     ws.column_dimensions["C"].width = 28
+    ws.column_dimensions["D"].width = 60
 
     current_row = 2
 
     for idx, item in enumerate(items, start=1):
+
         ws.cell(row=current_row, column=1, value=item.get("title", ""))
         ws.cell(row=current_row, column=2, value=item.get("category", ""))
+
+        link = item.get("url", "")
+        link_cell = ws.cell(row=current_row, column=4, value=link)
+        link_cell.hyperlink = link
+        link_cell.style = "Hyperlink"
 
         ws.cell(row=current_row, column=1).alignment = Alignment(vertical="top", wrap_text=True)
         ws.cell(row=current_row, column=2).alignment = Alignment(vertical="top", wrap_text=True)
 
         image_url = item.get("image")
+
         if image_url:
             raw_path = os.path.join(TEMP_IMG_DIR, f"img_{idx}.jpg")
             downloaded = download_image(image_url, raw_path)
 
             if downloaded:
                 prepared = prepare_excel_image(downloaded)
+
                 if prepared:
                     try:
                         img = XLImage(prepared)
@@ -120,10 +129,9 @@ async def collect_product_links(page, limit: int) -> List[str]:
         try:
             await page.wait_for_selector(selector, timeout=8000)
             found_selector = selector
-            logger.info("Найден селектор списка товаров: %s", selector)
             break
         except PlaywrightTimeoutError:
-            logger.info("Селектор не найден: %s", selector)
+            pass
 
     if not found_selector:
         raise RuntimeError("На странице продавца не найдены карточки товаров")
@@ -152,8 +160,10 @@ async def collect_product_links(page, limit: int) -> List[str]:
 
     for href in collected_links:
         nm_id = extract_nm_id(href)
+
         if not nm_id:
             continue
+
         if nm_id in seen:
             continue
 
@@ -162,10 +172,6 @@ async def collect_product_links(page, limit: int) -> List[str]:
 
         if len(result) >= limit:
             break
-
-    logger.info("Итоговое количество уникальных ссылок: %s", len(result))
-    if result:
-        logger.info("Первая ссылка: %s", result[0])
 
     return result
 
@@ -190,14 +196,10 @@ async def get_image_by_selectors(page, selectors: List[str]) -> Optional[str]:
             locator = page.locator(selector).first
             if await locator.count() > 0:
                 src = await locator.get_attribute("src")
-                current_src = await locator.get_attribute("currentSrc")
-                candidate = current_src or src
-                if candidate:
-                    if candidate.startswith("//"):
-                        candidate = "https:" + candidate
-                    elif candidate.startswith("/"):
-                        candidate = "https://www.wildberries.ru" + candidate
-                    return candidate
+                if src:
+                    if src.startswith("//"):
+                        src = "https:" + src
+                    return src
         except Exception:
             continue
     return None
@@ -205,71 +207,21 @@ async def get_image_by_selectors(page, selectors: List[str]) -> Optional[str]:
 
 async def parse_product_page(context, url: str) -> Dict:
     page = await context.new_page()
-    page.set_default_timeout(20000)
 
     try:
-        logger.info("Открываю карточку: %s", url)
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await page.goto(url, wait_until="domcontentloaded")
         await page.wait_for_timeout(3000)
 
-        title = None
-        try:
-            await page.wait_for_selector("h3", timeout=7000)
-            title = await page.locator("h3").first.inner_text()
-            title = " ".join(title.split())
-        except Exception:
-            pass
+        title = await get_text_by_selectors(page, ["h3"])
 
-        if not title:
-            title = await get_text_by_selectors(page, [
-                "h3",
-                ".product-page h3",
-                "[class*='product'] h3",
-            ])
-
-        if not title:
-            try:
-                html = await page.content()
-                match = re.search(r"<h3[^>]*>(.*?)</h3>", html, re.S)
-                if match:
-                    title = re.sub(r"<.*?>", "", match.group(1)).strip()
-                    title = " ".join(title.split())
-            except Exception:
-                pass
-
-        category = None
-        try:
-            await page.wait_for_selector("span.categoryLinkCategory--VSJ8c", timeout=7000)
-            category = await page.locator("span.categoryLinkCategory--VSJ8c").first.inner_text()
-            category = " ".join(category.split())
-        except Exception:
-            pass
-
-        if not category:
-            category = await get_text_by_selectors(page, [
-                "span.categoryLinkCategory--VSJ8c",
-                "span[class*='categoryLinkCategory']",
-            ])
-
-        if not category:
-            try:
-                html = await page.content()
-                match = re.search(
-                    r'class="categoryLinkCategory--VSJ8c">(.*?)</span>',
-                    html,
-                    re.S
-                )
-                if match:
-                    category = re.sub(r"<.*?>", "", match.group(1)).strip()
-                    category = " ".join(category.split())
-            except Exception:
-                pass
+        category = await get_text_by_selectors(page, [
+            "span.categoryLinkCategory--VSJ8c",
+            "[class*='categoryLinkCategory']",
+        ])
 
         image = await get_image_by_selectors(page, [
             ".swiper-slide-active img",
             ".product-page__slider img",
-            ".photo-zoom__preview img",
-            ".j-image-container img",
             "img[src*='wbbasket']",
             "img",
         ])
@@ -277,15 +229,10 @@ async def parse_product_page(context, url: str) -> Dict:
         nm_id = extract_nm_id(url)
 
         if not title:
-            title = f"Товар {nm_id}" if nm_id else "Без названия"
+            title = f"Товар {nm_id}"
 
         if not category:
             category = "Категория не найдена"
-
-        if not image and nm_id:
-            vol = nm_id // 100000
-            part = nm_id // 1000
-            image = f"https://basket-01.wbbasket.ru/vol{vol}/part{part}/{nm_id}/images/big/1.webp"
 
         return {
             "title": title,
@@ -301,111 +248,63 @@ async def parse_product_page(context, url: str) -> Dict:
 
 async def scrape_products() -> List[Dict]:
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
 
-        context = await browser.new_context(
-            viewport={"width": 1440, "height": 2200},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/123.0.0.0 Safari/537.36"
-            ),
-            locale="ru-RU",
-        )
+        browser = await p.chromium.launch(headless=True)
 
-        seller_page = await context.new_page()
-        seller_page.set_default_timeout(20000)
+        context = await browser.new_context()
 
-        try:
-            logger.info("Открываю страницу продавца")
-            await seller_page.goto(SELLER_URL, wait_until="domcontentloaded", timeout=30000)
-            await seller_page.wait_for_timeout(5000)
+        page = await context.new_page()
 
-            product_links = await collect_product_links(seller_page, LIMIT)
-            logger.info("Собрано ссылок на товары: %s", len(product_links))
+        await page.goto(SELLER_URL)
+        await page.wait_for_timeout(5000)
 
-            if not product_links:
-                raise RuntimeError("Не удалось собрать ссылки на товары")
+        product_links = await collect_product_links(page, LIMIT)
 
-            results = []
+        results = []
 
-            for index, url in enumerate(product_links[:LIMIT], start=1):
-                try:
-                    item = await parse_product_page(context, url)
+        for url in product_links[:LIMIT]:
 
-                    if index == 1 and (
-                        item.get("category") == "Категория не найдена"
-                        or item.get("title", "").startswith("Товар ")
-                    ):
-                        logger.info("Повторная попытка для первого товара")
-                        await asyncio.sleep(2)
-                        item = await parse_product_page(context, url)
+            item = await parse_product_page(context, url)
 
-                    results.append(item)
-                    await asyncio.sleep(0.7)
-                except Exception as e:
-                    logger.warning("Не удалось обработать %s: %s", url, e)
+            results.append(item)
 
-            return results
+            await asyncio.sleep(0.7)
 
-        finally:
-            await seller_page.close()
-            await context.close()
-            await browser.close()
+        await browser.close()
+
+        return results
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Напиши /novinki и я пришлю Excel-файл с 20 товарами")
+    await update.message.reply_text("Напиши /novinki и я пришлю Excel")
 
 
 async def novinki(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = await update.message.reply_text("Собираю товары...")
 
-    try:
-        items = await asyncio.wait_for(scrape_products(), timeout=180)
+    msg = await update.message.reply_text("Собираю товары...")
 
-        if not items:
-            await status_msg.edit_text("Не удалось найти товары.")
-            return
+    items = await scrape_products()
 
-        await status_msg.edit_text(f"Собрано {len(items)} товаров. Формирую Excel...")
+    file_path = save_to_xlsx(items, OUTPUT_XLSX)
 
-        file_path = save_to_xlsx(items, OUTPUT_XLSX)
+    with open(file_path, "rb") as f:
 
-        with open(file_path, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename="wb_products.xlsx",
-                caption="Готово: файл с товарами WB"
-            )
+        await update.message.reply_document(
+            document=f,
+            filename="wb_products.xlsx",
+            caption="Готово"
+        )
 
-        await status_msg.edit_text("Готово.")
-
-    except asyncio.TimeoutError:
-        logger.exception("Таймаут парсинга")
-        await status_msg.edit_text("Ошибка: парсинг завис по таймауту.")
-    except Exception as e:
-        logger.exception("Ошибка")
-        await status_msg.edit_text(f"Ошибка: {e}")
+    await msg.edit_text("Готово")
 
 
 def main():
-    if not TG_TOKEN:
-        raise RuntimeError("Добавь TG_BOT_TOKEN в Railway Variables")
 
     app = Application.builder().token(TG_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("novinki", novinki))
 
-    logger.info("Bot started")
     app.run_polling()
 
 
