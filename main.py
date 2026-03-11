@@ -7,11 +7,15 @@ from typing import List, Dict, Optional
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 
 TG_TOKEN = os.getenv("TG_BOT_TOKEN")
 
 SELLER_URL = "https://www.wildberries.ru/seller/92351?sort=newly&page=1"
 LIMIT = 20
+OUTPUT_XLSX = "wb_products.xlsx"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("wb_bot")
@@ -28,6 +32,49 @@ def build_image_url(nm_id: int) -> str:
     vol = nm_id // 100000
     part = nm_id // 1000
     return f"https://basket-01.wbbasket.ru/vol{vol}/part{part}/{nm_id}/images/big/1.webp"
+
+
+def save_to_xlsx(items: List[Dict], path: str) -> str:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Товары WB"
+
+    headers = ["Наименование", "Категория", "Картинка"]
+    ws.append(headers)
+
+    for item in items:
+        ws.append([
+            item.get("title", ""),
+            item.get("category", ""),
+            item.get("image", ""),
+        ])
+
+    # Оформление заголовка
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # Ширина колонок
+    widths = {
+        "A": 45,
+        "B": 30,
+        "C": 80,
+    }
+
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+
+    # Выравнивание
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    wb.save(path)
+    return path
 
 
 async def scrape_products() -> List[Dict]:
@@ -78,40 +125,51 @@ async def scrape_products() -> List[Dict]:
                     logger.info("Селектор не найден: %s", selector)
 
             if not found_selector:
-                html_preview = await page.content()
-                raise RuntimeError(
-                    "Карточки товаров не найдены на странице. "
-                    f"Длина HTML: {len(html_preview)}"
-                )
+                raise RuntimeError("Карточки товаров не найдены на странице")
 
             for _ in range(4):
                 await page.mouse.wheel(0, 2500)
                 await page.wait_for_timeout(1200)
 
-            links = await page.locator("a[href*='/catalog/'][href*='/detail.aspx']").evaluate_all(
-                """elements => elements.map(el => el.href).filter(Boolean)"""
+            cards = await page.locator("a[href*='/catalog/'][href*='/detail.aspx']").evaluate_all(
+                """
+                elements => elements.map(el => ({
+                    href: el.href,
+                    text: (el.innerText || '').trim()
+                }))
+                """
             )
 
-            logger.info("Найдено ссылок: %s", len(links))
+            logger.info("Найдено карточек: %s", len(cards))
 
             seen = set()
 
-            for href in links:
+            for card in cards:
+                href = card.get("href")
+                if not href:
+                    continue
+
                 nm_id = extract_nm_id(href)
                 if not nm_id or nm_id in seen:
                     continue
 
                 seen.add(nm_id)
+
+                title = " ".join((card.get("text") or "").split())
+                if not title:
+                    title = f"Товар {nm_id}"
+
                 results.append({
-                    "nm_id": nm_id,
-                    "url": href,
+                    "title": title[:180],
+                    "category": "Категория не найдена",
                     "image": build_image_url(nm_id),
+                    "url": href,
+                    "nm_id": nm_id,
                 })
 
                 if len(results) >= LIMIT:
                     break
 
-            logger.info("Собрано товаров: %s", len(results))
             return results
 
         finally:
@@ -120,34 +178,29 @@ async def scrape_products() -> List[Dict]:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Напиши /novinki")
+    await update.message.reply_text("Напиши /novinki и я пришлю Excel-файл с 20 товарами")
 
 
 async def novinki(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("Собираю товары...")
 
     try:
-        await status_msg.edit_text("Открываю страницу магазина...")
         items = await asyncio.wait_for(scrape_products(), timeout=90)
 
         if not items:
-            await status_msg.edit_text("Не удалось найти товары на странице продавца.")
+            await status_msg.edit_text("Не удалось найти товары.")
             return
 
-        await status_msg.edit_text(f"Нашёл {len(items)} товаров, отправляю...")
+        file_path = save_to_xlsx(items, OUTPUT_XLSX)
 
-        for i, item in enumerate(items, 1):
-            text = f"{i}. {item['url']}"
+        await status_msg.edit_text("Формирую Excel-файл...")
 
-            try:
-                await update.message.reply_photo(
-                    photo=item["image"],
-                    caption=text
-                )
-            except Exception:
-                await update.message.reply_text(text)
-
-            await asyncio.sleep(0.6)
+        with open(file_path, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename="wb_products.xlsx",
+                caption="Готово: 20 товаров в Excel"
+            )
 
         await status_msg.edit_text("Готово.")
 
@@ -155,7 +208,7 @@ async def novinki(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Таймаут парсинга")
         await status_msg.edit_text("Ошибка: парсинг завис по таймауту.")
     except Exception as e:
-        logger.exception("Ошибка парсинга")
+        logger.exception("Ошибка")
         await status_msg.edit_text(f"Ошибка: {e}")
 
 
