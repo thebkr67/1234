@@ -1,13 +1,10 @@
 import os
-import re
 import time
-import logging
 import requests
-
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-TOKEN = os.getenv("TG_BOT_TOKEN") or "PASTE_YOUR_TOKEN"
+TOKEN = os.getenv("TG_BOT_TOKEN") or "PASTE_YOUR_TELEGRAM_TOKEN"
 
 SELLER_ID = 92351
 LIMIT = 20
@@ -15,11 +12,8 @@ LIMIT = 20
 SEARCH_URL = "https://search.wb.ru/exactmatch/ru/common/v13/search"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0",
+    "User-Agent": "Mozilla/5.0"
 }
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("wb_bot")
 
 
 def build_image_url(nm_id):
@@ -29,13 +23,14 @@ def build_image_url(nm_id):
 
 
 def fetch_products():
+
     params = {
         "appType": 1,
         "curr": "rub",
         "dest": -1257786,
         "page": 1,
         "sort": "newly",
-        "supplier": SELLER_ID,
+        "supplier": SELLER_ID
     }
 
     r = requests.get(SEARCH_URL, params=params, headers=HEADERS)
@@ -48,13 +43,10 @@ def fetch_products():
     for p in products[:LIMIT]:
 
         nm_id = p.get("id")
-        title = p.get("name")
-        category = p.get("subject")
 
         result.append({
-            "nm_id": nm_id,
-            "title": title,
-            "category": category,
+            "title": p.get("name"),
+            "category": p.get("subject"),
             "image": build_image_url(nm_id),
             "url": f"https://www.wildberries.ru/catalog/{nm_id}/detail.aspx"
         })
@@ -63,12 +55,12 @@ def fetch_products():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Команда /novinki покажет 20 новинок магазина")
+    await update.message.reply_text("Напиши /novinki чтобы получить 20 товаров магазина")
 
 
 async def novinki(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    await update.message.reply_text("Парсим товары...")
+    await update.message.reply_text("Загружаю товары...")
 
     try:
 
@@ -80,12 +72,14 @@ async def novinki(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Категория: {item['category']}
 {item['url']}"""
 
-            await update.message.reply_photo(item["image"], caption=text)
+            await update.message.reply_photo(
+                photo=item["image"],
+                caption=text
+            )
 
-            time.sleep(0.5)
+            time.sleep(0.4)
 
     except Exception as e:
-
         await update.message.reply_text(f"Ошибка: {e}")
 
 
