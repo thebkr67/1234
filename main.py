@@ -118,8 +118,10 @@ def request_text(url: str, attempts: int = 5) -> str:
 
 
 def parse_seller_id(url: str) -> Optional[int]:
-    m = re.search(r"/seller/(\\d+)", url)
-    return int(m.group(1)) if m else None
+    m = re.search(r"/seller/(\d+)", url)
+    if m:
+        return int(m.group(1))
+    return None
 
 
 def parse_page(url: str) -> int:
@@ -184,12 +186,8 @@ def get_nm_id(product: Dict[str, Any]) -> Optional[int]:
 
 
 def get_catalog_params_from_page(seller_url: str) -> Dict[str, str]:
-    """
-    Пытаемся вытащить shard/query из HTML страницы продавца.
-    """
     html = request_text(seller_url)
 
-    # Иногда WB кладет данные прямо в HTML/скрипты
     shard_match = re.search(r'"shard":"([^"]+)"', html)
     query_match = re.search(r'"query":"([^"]*)"', html)
 
@@ -198,8 +196,7 @@ def get_catalog_params_from_page(seller_url: str) -> Dict[str, str]:
         query = query_match.group(1).replace("\\/", "/") if query_match else ""
         return {"shard": shard, "query": query}
 
-    # fallback: ищем catalog URL в HTML
-    url_match = re.search(r'https://catalog\\.wb\\.ru/[^"\\s]+', html)
+    url_match = re.search(r'https://catalog\.wb\.ru/[^"\s]+', html)
     if url_match:
         found_url = url_match.group(0)
         parsed = urlparse(found_url)
@@ -208,7 +205,6 @@ def get_catalog_params_from_page(seller_url: str) -> Dict[str, str]:
         query = qs.get("query", [""])[0]
         return {"shard": shard, "query": query}
 
-    # если ничего не нашли — используем наиболее типичный вариант
     return {"shard": "catalog", "query": ""}
 
 
@@ -218,7 +214,7 @@ def fetch_products_from_seller_page(seller_url: str, limit: int = 20) -> List[Di
     sort = parse_sort(seller_url)
 
     if not seller_id:
-        raise RuntimeError("Не удалось определить sellerId из ссылки")
+        raise RuntimeError(f"Не удалось определить sellerId из ссылки: {seller_url}")
 
     catalog_meta = get_catalog_params_from_page(seller_url)
     shard = catalog_meta["shard"]
