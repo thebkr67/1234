@@ -1,2 +1,3 @@
 python-telegram-bot>=22
-playwright
+requests
+playwright==1.58.0
