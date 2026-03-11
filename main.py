@@ -35,10 +35,8 @@ def download_image(image_url: str, file_path: str) -> Optional[str]:
     try:
         response = requests.get(image_url, timeout=30)
         response.raise_for_status()
-
         with open(file_path, "wb") as f:
             f.write(response.content)
-
         return file_path
     except Exception as e:
         logger.warning("Не удалось скачать картинку %s: %s", image_url, e)
@@ -158,7 +156,6 @@ async def collect_product_links(page, limit: int) -> List[str]:
         nm_id = extract_nm_id(href)
         if not nm_id:
             continue
-
         if nm_id in seen:
             continue
 
@@ -217,17 +214,30 @@ async def parse_product_page(context, url: str) -> Dict:
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(3000)
 
+        # Наименование строго из h3
         title = await get_text_by_selectors(page, [
             "h3",
             ".product-page h3",
             "[class*='product'] h3",
         ])
 
-        category = await get_text_by_selectors(page, [
-            "span.categoryLinkCategory--VSJ8c",
-            "[class*='categoryLinkCategory']",
-        ])
+        # Категория строго из нужного span
+        category = None
 
+        try:
+            await page.wait_for_selector("span.categoryLinkCategory--VSJ8c", timeout=7000)
+            category = await page.locator("span.categoryLinkCategory--VSJ8c").first.inner_text()
+            category = " ".join(category.split())
+        except Exception:
+            pass
+
+        if not category:
+            category = await get_text_by_selectors(page, [
+                "span.categoryLinkCategory--VSJ8c",
+                "span[class*='categoryLinkCategory']",
+            ])
+
+        # Картинка
         image = await get_image_by_selectors(page, [
             ".swiper-slide-active img",
             ".product-page__slider img",
@@ -299,9 +309,16 @@ async def scrape_products() -> List[Dict]:
 
             results = []
 
-            for url in product_links[:LIMIT]:
+            for index, url in enumerate(product_links[:LIMIT], start=1):
                 try:
                     item = await parse_product_page(context, url)
+
+                    # для первого товара даем чуть больше времени на догрузку категории
+                    if index == 1 and item.get("category") == "Категория не найдена":
+                        logger.info("Повторная попытка для категории первого товара")
+                        await asyncio.sleep(2)
+                        item = await parse_product_page(context, url)
+
                     results.append(item)
                     await asyncio.sleep(0.7)
                 except Exception as e:
