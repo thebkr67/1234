@@ -29,6 +29,7 @@ SELLERS = [
 LIMIT = 20
 OUTPUT_XLSX = "wb_products.xlsx"
 TEMP_IMG_DIR = "temp_images"
+BOT_USERNAME = "vatras_bot"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("wb_bot")
@@ -472,17 +473,14 @@ async def handle_mentions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip().lower()
 
-    try:
-        me = await context.bot.get_me()
-        username = (me.username or "").lower()
-    except Exception:
-        username = ""
+    trigger_patterns = [
+        f"@{BOT_USERNAME} /novinki",
+        f"@{BOT_USERNAME} novinki",
+        f"@{BOT_USERNAME} новинки",
+        f"/novinki@{BOT_USERNAME}",
+    ]
 
-    triggers = ["/novinki", "novinki", "новинки"]
-    is_trigger = any(trigger in text for trigger in triggers)
-    is_tagged = f"@{username}" in text if username else False
-
-    if is_trigger and is_tagged:
+    if any(pattern in text for pattern in trigger_patterns):
         await novinki(update, context)
 
 
@@ -493,7 +491,7 @@ def main():
     app = Application.builder().token(TG_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("novinki", novinki))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_mentions))
+    app.add_handler(MessageHandler(filters.TEXT, handle_mentions))
 
     logger.info("Bot started")
     app.run_polling()
