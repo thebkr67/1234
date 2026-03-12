@@ -29,7 +29,7 @@ SELLERS = [
 LIMIT = 20
 OUTPUT_XLSX = "wb_products.xlsx"
 TEMP_IMG_DIR = "temp_images"
-BOT_USERNAME = "vatras_bot"
+BOT_USERNAME = "@vatras_bot"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("wb_bot")
