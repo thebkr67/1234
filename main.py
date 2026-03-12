@@ -6,7 +6,13 @@ from typing import List, Dict, Optional
 
 import requests
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -460,6 +466,26 @@ async def novinki(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(f"Ошибка: {e}")
 
 
+async def handle_mentions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    text = update.message.text.strip().lower()
+
+    try:
+        me = await context.bot.get_me()
+        username = (me.username or "").lower()
+    except Exception:
+        username = ""
+
+    triggers = ["/novinki", "novinki", "новинки"]
+    is_trigger = any(trigger in text for trigger in triggers)
+    is_tagged = f"@{username}" in text if username else False
+
+    if is_trigger and is_tagged:
+        await novinki(update, context)
+
+
 def main():
     if not TG_TOKEN:
         raise RuntimeError("Добавь TG_BOT_TOKEN в Railway Variables")
@@ -467,6 +493,7 @@ def main():
     app = Application.builder().token(TG_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("novinki", novinki))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_mentions))
 
     logger.info("Bot started")
     app.run_polling()
